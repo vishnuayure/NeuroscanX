@@ -1,0 +1,15 @@
+# Core (required)
+numpy>=1.26
+scipy>=1.11
+nibabel>=5.2
+scikit-image>=0.22
+# Desktop application (required for `python main.py`)
+PySide6>=6.6
+pyvista>=0.43
+pyvistaqt>=0.11
+# Tests
+pytest>=8.0
+# Optional: LangGraph orchestration of the explanation layer (falls back to a sequential runner if absent)
+# langgraph>=0.2
+# Optional: GPU acceleration (install the CUDA build of PyTorch from pytorch.org for your driver)
+# torch

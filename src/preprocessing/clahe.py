@@ -1,76 +1,24 @@
+"""Slice-wise CLAHE for local-contrast enhancement.
+
+CLAHE is *not* applied to the clustering features by default: it is non-linear and would
+destroy the quantitative relationship between modalities that the fuzzy clustering and the
+tumor-cluster scoring rely on.  It is used to strengthen weak boundaries for edge extraction
+and for display (see PreprocessConfig.clahe_apply_to).
+"""
 from __future__ import annotations
 
 import numpy as np
-from skimage.exposure import equalize_adapthist
-
-from src.io.nifti_loader import NiftiVolume
+from skimage import exposure
 
 
-def clahe_enhance(
-    data: np.ndarray,
-    clip_limit: float = 0.01,
-    kernel_size: int | tuple[int, int, int] | None = None,
-) -> np.ndarray:
-    data = np.asarray(data, dtype=np.float32)
-
-    if data.ndim != 3:
-        raise ValueError(
-            f"Expected 3D volume, got shape {data.shape}."
-        )
-
-    if clip_limit <= 0:
-        raise ValueError(
-            "clip_limit must be greater than 0."
-        )
-
-    finite_mask = np.isfinite(data)
-
-    if not np.any(finite_mask):
-        return np.zeros_like(data, dtype=np.float32)
-
-    values = data[finite_mask]
-    minimum = np.min(values)
-    maximum = np.max(values)
-
-    if maximum == minimum:
-        return np.zeros_like(data, dtype=np.float32)
-
-    normalized = np.zeros_like(data, dtype=np.float32)
-    normalized[finite_mask] = (
-        (data[finite_mask] - minimum)
-        / (maximum - minimum)
-    )
-
-    enhanced = equalize_adapthist(
-        normalized,
-        kernel_size=kernel_size,
-        clip_limit=clip_limit,
-    )
-
-    output = np.zeros_like(data, dtype=np.float32)
-    output[finite_mask] = enhanced[finite_mask]
-
-    return output
-
-
-def clahe_volume(
-    volume: NiftiVolume | np.ndarray,
-    clip_limit: float = 0.01,
-    kernel_size: int | tuple[int, int, int] | None = None,
-) -> np.ndarray:
-    if hasattr(volume, "get_data"):
-        data = volume.get_data(dtype=np.float32)
-    else:
-        data = np.asarray(volume, dtype=np.float32)
-
-    return clahe_enhance(
-        data=data,
-        clip_limit=clip_limit,
-        kernel_size=kernel_size,
-    )
-
-
-__all__ = [
-    "clahe_enhance",
-    "clahe_volume",
-]
+def clahe_volume(vol01: np.ndarray, mask: np.ndarray, clip_limit: float = 0.01, kernel_fraction: float = 0.125) -> np.ndarray:
+    """vol01 must be in [0, 1].  Operates on axial slices that contain brain; background stays 0."""
+    out = np.zeros_like(vol01)
+    ks = max(8, int(round(min(vol01.shape[:2]) * kernel_fraction)))
+    for k in range(vol01.shape[2]):
+        m = mask[:, :, k]
+        if m.sum() < 25:
+            continue
+        sl = exposure.equalize_adapthist(vol01[:, :, k], kernel_size=ks, clip_limit=clip_limit)
+        out[:, :, k] = np.where(m, sl, 0.0)
+    return out.astype(np.float32, copy=False)

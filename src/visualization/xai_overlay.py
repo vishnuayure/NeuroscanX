@@ -1,119 +1,54 @@
-import numpy as np
-import matplotlib.pyplot as plt
+"""Data model for the XAI HUD – turns the structured summary into display rows (no Qt, fully testable).
+
+Every value shown comes straight from the computed summary / local evidence."""
+from __future__ import annotations
+
+from ..xai.explanation import confidence_label
+
+CONF_COLORS = {"HIGH": "#3ddc97", "MODERATE": "#ffc857", "LOW": "#ff6b81"}
 
 
-def normalize_map(data: np.ndarray) -> np.ndarray:
-    data = np.asarray(data, dtype=np.float32)
-
-    minimum = np.nanmin(data)
-    maximum = np.nanmax(data)
-
-    if maximum <= minimum:
-        return np.zeros_like(data, dtype=np.float32)
-
-    return ((data - minimum) / (maximum - minimum)).astype(np.float32)
+def _lvl(v: float) -> str:
+    return "HIGH" if v >= 0.7 else "MODERATE" if v >= 0.4 else "LOW"
 
 
-def create_xai_overlay(
-    image: np.ndarray,
-    evidence: np.ndarray,
-    alpha: float = 0.5,
-    cmap: str = "jet"
-) -> np.ndarray:
-    image = np.asarray(image, dtype=np.float32)
-    evidence = np.asarray(evidence, dtype=np.float32)
-
-    if image.shape != evidence.shape:
-        raise ValueError("Image and evidence must have the same shape")
-
-    if not 0 <= alpha <= 1:
-        raise ValueError("alpha must be between 0 and 1")
-
-    image = normalize_map(image)
-    evidence = normalize_map(evidence)
-
-    base = np.stack([image, image, image], axis=-1)
-    heatmap = plt.get_cmap(cmap)(evidence)[..., :3]
-
-    mask = evidence > 0
-
-    base[mask] = (
-        (1 - alpha) * base[mask] +
-        alpha * heatmap[mask]
-    )
-
-    return np.clip(base, 0, 1).astype(np.float32)
-
-
-def xai_overlay_slice(
-    image: np.ndarray,
-    evidence: np.ndarray,
-    plane: str,
-    index: int,
-    alpha: float = 0.5,
-    cmap: str = "jet"
-) -> np.ndarray:
-    if image.ndim != 3 or evidence.ndim != 3:
-        raise ValueError("Image and evidence must be 3D")
-
-    if image.shape != evidence.shape:
-        raise ValueError("Image and evidence must have the same shape")
-
-    if plane == "axial":
-        image_slice = image[:, :, index]
-        evidence_slice = evidence[:, :, index]
-    elif plane == "coronal":
-        image_slice = image[:, index, :]
-        evidence_slice = evidence[:, index, :]
-    elif plane == "sagittal":
-        image_slice = image[index, :, :]
-        evidence_slice = evidence[index, :, :]
-    else:
-        raise ValueError("Plane must be axial, coronal, or sagittal")
-
-    return create_xai_overlay(
-        image_slice,
-        evidence_slice,
-        alpha=alpha,
-        cmap=cmap
-    )
+def build_hud_model(result) -> dict:
+    s = result.xai_summary
+    ev, bd = result.evidence, result.boundary_analysis
+    conf = s["segmentation"]["confidence"]
+    rows = []
+    mods = {k: v for k, v in result.modality_contribution.items() if not k.startswith("_")}
+    for name, m in sorted(mods.items(), key=lambda kv: -kv[1]["contribution"]):
+        rows.append({"name": name, "value": m["relative"], "level": m["level"], "detail": f"{m['contribution']:.0%}"})
+    if ev.get("available"):
+        rows.append({"name": "EDGE", "value": ev["edge_evidence"], "level": _lvl(ev["edge_evidence"]), "detail": f"{ev['edge_evidence']:.0%}"})
+        rows.append({"name": "SPATIAL", "value": ev["spatial_evidence"], "level": _lvl(ev["spatial_evidence"]), "detail": f"{ev['spatial_evidence']:.0%}"})
+    why = ""
+    if ev.get("available"):
+        top = [n for n, m in sorted(mods.items(), key=lambda kv: -kv[1]["contribution"]) if m["level"] != "LOW"]
+        why = (f"{' + '.join(top[:3]) or 'Multimodal'} evidence; "
+               f"{'spatially coherent region' if ev['largest_component_fraction'] >= 0.9 else 'fragmented region'}; "
+               f"{'strong' if ev['edge_support'] >= 0.5 else 'moderate' if ev['edge_support'] >= 0.25 else 'weak'} boundary evidence.")
+    bconf = bd.get("boundary_confidence") if bd.get("available") else None
+    return {
+        "title": "WHOLE TUMOR",
+        "confidence": conf, "confidence_label": confidence_label(conf),
+        "evidence": rows,
+        "boundary_confidence": bconf, "boundary_label": confidence_label(bconf),
+        "most_uncertain_side": bd.get("most_uncertain_side"),
+        "why": why,
+        "uncertainty_mean": s.get("uncertainty", {}).get("mean_uncertainty_tumor"),
+        "uncertainty_label": s.get("uncertainty", {}).get("label", ""),
+        "volume_ml": s.get("region", {}).get("volume_ml"),
+        "method": s.get("method_label"), "explanation_source": result.explanation_source,
+    }
 
 
-def show_xai_overlay(
-    image: np.ndarray,
-    evidence: np.ndarray,
-    plane: str = "axial",
-    index: int | None = None,
-    alpha: float = 0.5,
-    cmap: str = "jet"
-):
-    if index is None:
-        index = {
-            "axial": image.shape[2] // 2,
-            "coronal": image.shape[1] // 2,
-            "sagittal": image.shape[0] // 2
-        }[plane]
-
-    overlay = xai_overlay_slice(
-        image,
-        evidence,
-        plane,
-        index,
-        alpha,
-        cmap
-    )
-
-    plt.figure(figsize=(7, 7))
-    plt.imshow(np.rot90(overlay))
-    plt.title(f"{plane.capitalize()} XAI Evidence")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.show()
-
-
-__all__ = [
-    "normalize_map",
-    "create_xai_overlay",
-    "xai_overlay_slice",
-    "show_xai_overlay"
-]
+def build_local_model(loc: dict) -> dict:
+    if not loc or not loc.get("inside_brain"):
+        return {"inside": False}
+    rows = [{"name": n, "value": v, "z": loc["z"][n]} for n, v in sorted(loc["local_contribution"].items(), key=lambda kv: -kv[1])]
+    return {"inside": True, "in_tumor": loc["in_tumor"], "membership": loc["tumor_membership"],
+            "intensity_membership": loc["intensity_membership"], "uncertainty": loc["uncertainty"],
+            "edge": loc["edge_strength"], "support": loc["neighbourhood_support"], "rows": rows,
+            "distance_mm": loc["distance_to_boundary_mm"], "text": loc["local_explanation"]}

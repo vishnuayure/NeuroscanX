@@ -1,208 +1,144 @@
+"""Genuine Fuzzy C-Means (Bezdek) – the baseline.
+
+Minimises   J(U, V) = Σ_i Σ_k  u_ki^m · ||x_i − v_k||²     subject to  Σ_k u_ki = 1
+
+Alternating updates:
+    v_k  = Σ_i u_ki^m x_i / Σ_i u_ki^m
+    u_ki = 1 / Σ_j ( d_ki / d_ji )^{2/(m−1)}   ≡   d_ki^{−2/(m−1)} / Σ_j d_ji^{−2/(m−1)}
+
+Initialisation is deterministic (seeded k-means++ on a voxel subsample).  For very large volumes the
+centres can be fitted on a seeded random subsample of brain voxels (`max_fit_samples`); the final
+memberships are then always evaluated for **every** voxel.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
 import numpy as np
 
+from ..utils.backend import NumpyOps
 
-class FCM:
-    def __init__(
-        self,
-        n_clusters: int = 4,
-        m: float = 2.0,
-        max_iter: int = 100,
-        error: float = 1e-5,
-        random_state: int = 42
-    ):
-        if n_clusters < 2:
-            raise ValueError("n_clusters must be at least 2")
-        if m <= 1:
-            raise ValueError("m must be greater than 1")
-        if max_iter <= 0:
-            raise ValueError("max_iter must be positive")
-        if error <= 0:
-            raise ValueError("error must be positive")
+log = logging.getLogger("neuroscanx")
 
-        self.n_clusters = n_clusters
-        self.m = m
-        self.max_iter = max_iter
-        self.error = error
-        self.random_state = random_state
-        self.centers = None
-        self.membership = None
-        self.labels = None
-        self.n_iter_ = 0
 
-    def _initialize_membership(self, n_samples: int) -> np.ndarray:
-        rng = np.random.default_rng(self.random_state)
-        membership = rng.random((n_samples, self.n_clusters))
-        membership /= membership.sum(axis=1, keepdims=True)
-        return membership
+@dataclass
+class FCMResult:
+    centers: np.ndarray                 # (C, D)
+    membership: Optional[np.ndarray]    # (C, N) or (C, *box); None if not requested
+    objective_history: List[float] = field(default_factory=list)
+    n_iter: int = 0
+    converged: bool = False
+    final_delta: float = float("nan")
+    method: str = "fcm"
+    elapsed: float = 0.0
+    params: dict = field(default_factory=dict)
+    device: str = "cpu"
 
-    def _update_centers(
-        self,
-        data: np.ndarray,
-        membership: np.ndarray
-    ) -> np.ndarray:
-        weights = membership ** self.m
-        denominator = weights.sum(axis=0)
+    @property
+    def objective(self) -> float:
+        return self.objective_history[-1] if self.objective_history else float("nan")
 
-        centers = (
-            weights.T @ data
-        ) / np.maximum(denominator[:, None], 1e-12)
 
-        return centers
+def kmeanspp_init(X: np.ndarray, n_clusters: int, rng: np.random.Generator) -> np.ndarray:
+    n = X.shape[0]
+    centers = [X[rng.integers(n)]]
+    d2 = ((X - centers[0]) ** 2).sum(1)
+    for _ in range(1, n_clusters):
+        p = d2 / max(d2.sum(), 1e-12)
+        centers.append(X[rng.choice(n, p=p)])
+        d2 = np.minimum(d2, ((X - centers[-1]) ** 2).sum(1))
+    # order by mean intensity so cluster ids are reproducible (they remain *arbitrary* semantically)
+    c = np.array(centers, dtype=np.float32)
+    return c[np.argsort(c.mean(1))]
 
-    def _update_membership(
-        self,
-        data: np.ndarray,
-        centers: np.ndarray
-    ) -> np.ndarray:
-        distances = np.linalg.norm(
-            data[:, None, :] - centers[None, :, :],
-            axis=2
-        )
 
-        zero_distance = distances == 0
+def _dist2_flat(ops, Xd, V):
+    C = V.shape[0]
+    D2 = ops.zeros((C, Xd.shape[0]))
+    for k in range(C):
+        D2[k] = ((Xd - ops.array(V[k])) ** 2).sum(1)
+    return D2
 
-        if np.any(zero_distance):
-            membership = np.zeros_like(distances)
-            rows = np.where(zero_distance.any(axis=1))[0]
 
-            for row in rows:
-                clusters = np.where(zero_distance[row])[0]
-                membership[row, clusters] = 1.0 / len(clusters)
+def _membership_from_d2(ops, D2, m, eps):
+    inv = ops.pow(ops.clip_min(D2, eps), -1.0 / (m - 1.0))
+    return inv / inv.sum(0)
 
-            nonzero_rows = np.where(~zero_distance.any(axis=1))[0]
 
-            if len(nonzero_rows) > 0:
-                d = distances[nonzero_rows]
-                power = 2.0 / (self.m - 1.0)
-                ratios = (d[:, :, None] / d[:, None, :]) ** power
-                membership[nonzero_rows] = 1.0 / ratios.sum(axis=2)
+def memberships_from_centers(X: np.ndarray, V: np.ndarray, m: float = 2.0, eps: float = 1e-8, ops=None,
+                             chunk: int = 1_000_000) -> np.ndarray:
+    """Intensity-only fuzzy memberships for fixed centres (used for final FCM output and XAI)."""
+    ops = ops or NumpyOps()
+    out = np.empty((V.shape[0], X.shape[0]), dtype=np.float32)
+    for s in range(0, X.shape[0], chunk):
+        Xd = ops.array(X[s:s + chunk])
+        out[:, s:s + chunk] = ops.host(_membership_from_d2(ops, _dist2_flat(ops, Xd, V), m, eps))
+    return out
 
-            return membership
 
-        power = 2.0 / (self.m - 1.0)
-        ratios = (
-            distances[:, :, None] /
-            distances[:, None, :]
-        ) ** power
-
-        return 1.0 / ratios.sum(axis=2)
-
-    def fit(self, data: np.ndarray):
-        data = np.asarray(data, dtype=np.float32)
-
-        if data.ndim == 3:
-            original_shape = data.shape
-            data = data.reshape(-1, 1)
-        elif data.ndim == 2:
-            original_shape = None
+def fuzzy_cmeans(X: np.ndarray, n_clusters: int = 5, m: float = 2.0, tol: float = 1e-3, max_iter: int = 100,
+                 seed: int = 42, eps: float = 1e-8, init_centers: Optional[np.ndarray] = None,
+                 max_fit_samples: Optional[int] = None, return_membership: bool = True, ops=None) -> FCMResult:
+    """Fuzzy C-Means on a (N, D) feature matrix.  Returns centres, memberships, objective history."""
+    if m <= 1.0:
+        raise ValueError("fuzziness m must be > 1")
+    ops = ops or NumpyOps()
+    t0 = time.time()
+    X = np.ascontiguousarray(X, dtype=np.float32)
+    n = X.shape[0]
+    if n < n_clusters:
+        raise ValueError("fewer samples than clusters")
+    rng = np.random.default_rng(seed)
+    Xfit = X
+    if max_fit_samples and n > max_fit_samples:
+        Xfit = X[np.sort(rng.choice(n, max_fit_samples, replace=False))]
+    V = (np.array(init_centers, dtype=np.float32) if init_centers is not None
+         else kmeanspp_init(Xfit[rng.choice(Xfit.shape[0], min(20000, Xfit.shape[0]), replace=False)], n_clusters, rng))
+    Xd = ops.array(Xfit)
+    hist: List[float] = []
+    delta, converged, U = float("inf"), False, None
+    it = 0
+    for it in range(1, max_iter + 1):
+        D2 = _dist2_flat(ops, Xd, V)
+        Unew = _membership_from_d2(ops, D2, m, eps)
+        delta = float("inf") if U is None else ops.max_abs_diff(Unew, U)
+        U = Unew
+        Um = ops.pow(U, m)
+        den = Um.sum(1)
+        num = Um @ Xd
+        V = (ops.host(num) / np.maximum(ops.host(den)[:, None], eps)).astype(np.float32)
+        hist.append(ops.to_float((Um * D2).sum()))
+        if delta < tol:
+            converged = True
+            break
+    mem = None
+    if return_membership:
+        if Xfit is X and U is not None:
+            mem = ops.host(_membership_from_d2(ops, _dist2_flat(ops, Xd, V), m, eps)).astype(np.float32)
         else:
-            raise ValueError("Input data must be 2D or 3D")
-
-        if len(data) == 0:
-            raise ValueError("Input data cannot be empty")
-
-        if not np.all(np.isfinite(data)):
-            raise ValueError("Input data contains non-finite values")
-
-        membership = self._initialize_membership(len(data))
-
-        for iteration in range(self.max_iter):
-            centers = self._update_centers(data, membership)
-            new_membership = self._update_membership(data, centers)
-
-            change = np.max(
-                np.abs(new_membership - membership)
-            )
-
-            membership = new_membership
-
-            if change < self.error:
-                self.n_iter_ = iteration + 1
-                break
-        else:
-            self.n_iter_ = self.max_iter
-
-        self.centers = centers
-        self.membership = membership
-        self.labels = np.argmax(membership, axis=1)
-
-        if original_shape is not None:
-            self.labels = self.labels.reshape(original_shape)
-            self.membership = self.membership.reshape(
-                *original_shape,
-                self.n_clusters
-            )
-
-        return self
-
-    def predict(self, data: np.ndarray) -> np.ndarray:
-        if self.centers is None:
-            raise RuntimeError("FCM model has not been fitted")
-
-        data = np.asarray(data, dtype=np.float32)
-        original_shape = data.shape
-
-        if data.ndim == 3:
-            data = data.reshape(-1, 1)
-        elif data.ndim != 2:
-            raise ValueError("Input data must be 2D or 3D")
-
-        if not np.all(np.isfinite(data)):
-            raise ValueError("Input data contains non-finite values")
-
-        membership = self._update_membership(data, self.centers)
-        labels = np.argmax(membership, axis=1)
-
-        if len(original_shape) == 3:
-            labels = labels.reshape(original_shape)
-
-        return labels
-
-    def transform(self, data: np.ndarray) -> np.ndarray:
-        if self.centers is None:
-            raise RuntimeError("FCM model has not been fitted")
-
-        data = np.asarray(data, dtype=np.float32)
-
-        if data.ndim == 3:
-            data = data.reshape(-1, 1)
-        elif data.ndim != 2:
-            raise ValueError("Input data must be 2D or 3D")
-
-        if not np.all(np.isfinite(data)):
-            raise ValueError("Input data contains non-finite values")
-
-        membership = self._update_membership(data, self.centers)
-
-        if len(data.shape) == 2:
-            return membership
-
-        return membership
+            mem = memberships_from_centers(X, V, m, eps, ops)
+        Um = mem.astype(np.float64) ** m
+        d2 = np.zeros_like(Um)
+        for k in range(V.shape[0]):
+            d2[k] = ((X - V[k]) ** 2).sum(1)
+        hist.append(float((Um * d2).sum()))   # objective on *all* samples
+    log.info("FCM: %d iterations, converged=%s, J=%.4g", it, converged, hist[-1])
+    return FCMResult(centers=V, membership=mem, objective_history=hist, n_iter=it, converged=converged,
+                     final_delta=float(delta), method="fcm", elapsed=time.time() - t0,
+                     params=dict(n_clusters=n_clusters, m=m, tol=tol, max_iter=max_iter, seed=seed), device=ops.name)
 
 
-def fuzzy_c_means(
-    data: np.ndarray,
-    n_clusters: int = 4,
-    m: float = 2.0,
-    max_iter: int = 100,
-    error: float = 1e-5,
-    random_state: int = 42,
-) -> tuple[np.ndarray, np.ndarray, FCM]:
-    """
-    Standard Fuzzy C-Means segmentation.
-
-    Returns:
-        tuple: (labels, membership, model)
-    """
-    model = FCM(
-        n_clusters=n_clusters,
-        m=m,
-        max_iter=max_iter,
-        error=error,
-        random_state=random_state,
-    )
-    model.fit(data)
-    return model.labels, model.membership, model
-
-
-__all__ = ["FCM", "fuzzy_c_means"]
+def fcm_volume(features: np.ndarray, mask_box: np.ndarray, cfg, ops=None, return_membership=True) -> FCMResult:
+    """Run FCM on the brain voxels of a (D, *box) feature array; membership → (C, *box)."""
+    D = features.shape[0]
+    X = features[:, mask_box].T                      # (N, D)
+    res = fuzzy_cmeans(X, cfg.n_clusters, cfg.m, cfg.tol, cfg.max_iter, cfg.seed, cfg.eps,
+                       max_fit_samples=cfg.init_samples, return_membership=return_membership, ops=ops)
+    if res.membership is not None:
+        full = np.zeros((cfg.n_clusters,) + mask_box.shape, dtype=np.float32)
+        full[:, mask_box] = res.membership
+        res.membership = full
+    return res

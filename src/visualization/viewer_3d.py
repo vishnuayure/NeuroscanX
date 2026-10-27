@@ -1,103 +1,77 @@
+"""3-D surfaces generated from the *actual* volumes (marching cubes) – no placeholder geometry.
+
+Coordinates are millimetres in the canonical RAS+ array frame (x→Right, y→Anterior, z→Superior).
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
 import numpy as np
-import matplotlib.pyplot as plt
-from skimage.measure import marching_cubes
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from scipy import ndimage as ndi
+from skimage import measure
+
+log = logging.getLogger("neuroscanx")
 
 
-class Brain3DViewer:
-    def __init__(self, volume: np.ndarray, segmentation: np.ndarray | None = None):
-        self.volume = np.asarray(volume, dtype=np.float32)
-
-        if self.volume.ndim != 3:
-            raise ValueError("Volume must be 3D")
-
-        if segmentation is not None:
-            self.segmentation = np.asarray(segmentation)
-
-            if self.segmentation.shape != self.volume.shape:
-                raise ValueError("Volume and segmentation must have the same shape")
-        else:
-            self.segmentation = None
-
-    def _get_surface(self, data: np.ndarray, level: float = 0.5):
-        if np.max(data) <= level:
-            return None, None
-
-        vertices, faces, _, _ = marching_cubes(
-            data.astype(np.float32),
-            level=level
-        )
-
-        return vertices, faces
-
-    def show(self, brain_threshold: float = 0.2):
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection="3d")
-
-        brain = self.volume.copy()
-
-        minimum = np.nanmin(brain)
-        maximum = np.nanmax(brain)
-
-        if maximum > minimum:
-            brain = (brain - minimum) / (maximum - minimum)
-
-        brain_mask = brain > brain_threshold
-
-        vertices, faces = self._get_surface(
-            brain_mask,
-            level=0.5
-        )
-
-        if vertices is not None:
-            brain_mesh = Poly3DCollection(
-                vertices[faces],
-                alpha=0.15
-            )
-            ax.add_collection3d(brain_mesh)
-
-        if self.segmentation is not None:
-            tumour_mask = self.segmentation > 0
-
-            vertices, faces = self._get_surface(
-                tumour_mask,
-                level=0.5
-            )
-
-            if vertices is not None:
-                tumour_mesh = Poly3DCollection(
-                    vertices[faces],
-                    alpha=0.8
-                )
-                ax.add_collection3d(tumour_mesh)
-
-        ax.set_xlim(0, self.volume.shape[0])
-        ax.set_ylim(0, self.volume.shape[1])
-        ax.set_zlim(0, self.volume.shape[2])
-
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-        ax.set_title("Brain Volume and Tumour Mesh")
-
-        plt.tight_layout()
-        plt.show()
+def _to_polydata(verts_vox: np.ndarray, faces: np.ndarray, spacing, scalars: dict):
+    import pyvista as pv
+    verts = verts_vox * np.asarray(spacing, float)[None, :]
+    f = np.hstack([np.full((faces.shape[0], 1), 3, np.int64), faces.astype(np.int64)]).ravel()
+    mesh = pv.PolyData(verts.astype(np.float32), f)
+    for k, v in scalars.items():
+        mesh.point_data[k] = v.astype(np.float32)
+    return mesh
 
 
-def show_brain_3d(
-    volume: np.ndarray,
-    segmentation: np.ndarray | None = None,
-    brain_threshold: float = 0.2
-):
-    viewer = Brain3DViewer(
-        volume,
-        segmentation
-    )
+def mask_to_mesh(mask: np.ndarray, spacing, sigma: float = 1.0, step: int = 1, level: float = 0.5,
+                 scalar_volumes: Optional[dict] = None, smooth_iters: int = 12):
+    """Binary mask → smooth triangle surface (pyvista PolyData) or None if the mask is empty.
 
-    viewer.show(brain_threshold)
+    scalar_volumes = {name: 3-D array}: sampled at the vertices (trilinear) and attached as point data.
+    """
+    if mask is None or not mask.any():
+        return None
+    idx = np.argwhere(mask)
+    lo = np.maximum(idx.min(0) - 3, 0)
+    hi = np.minimum(idx.max(0) + 4, mask.shape)
+    sl = tuple(slice(a, b) for a, b in zip(lo, hi))
+    sub = ndi.gaussian_filter(mask[sl].astype(np.float32), sigma) if sigma > 0 else mask[sl].astype(np.float32)
+    sub = np.pad(sub, 1)
+    if sub.max() <= level:
+        return None
+    try:
+        verts, faces, _, _ = measure.marching_cubes(sub, level=level, step_size=step)
+    except (ValueError, RuntimeError):
+        return None
+    verts = verts - 1 + lo[None, :]                                  # back to full-volume voxel coords
+    scalars = {}
+    for name, vol in (scalar_volumes or {}).items():
+        scalars[name] = ndi.map_coordinates(vol, verts.T, order=1, mode="nearest")
+    mesh = _to_polydata(verts, faces, spacing, scalars)
+    if smooth_iters:
+        mesh = mesh.smooth(n_iter=smooth_iters, relaxation_factor=0.1)
+    return mesh.compute_normals(auto_orient_normals=False, split_vertices=False)
 
 
-__all__ = [
-    "Brain3DViewer",
-    "show_brain_3d"
-]
+def build_meshes(result) -> dict:
+    """Brain surface, tumor surface (+uncertainty/edge/membership scalars) and high-confidence core surface."""
+    sp = result.mri.voxel_spacing
+    seg = result.segmentation.astype(bool)
+    unc, edges, t = result.uncertainty, result.edges, result.membership.tumor
+    # local uncertainty / boundary-evidence around each surface vertex (5³ and 3³ windows)
+    local_unc = ndi.uniform_filter(unc, size=5)
+    local_edge = ndi.maximum_filter(edges, size=3)
+    out = {}
+    out["brain"] = mask_to_mesh(result.preprocessing.brain_mask, sp, sigma=1.5, step=2, smooth_iters=15)
+    out["tumor"] = mask_to_mesh(seg, sp, sigma=0.8, step=1, scalar_volumes={
+        "uncertainty": local_unc, "edge": local_edge, "membership": t})
+    core = seg & (t >= 0.9)
+    out["core"] = mask_to_mesh(core, sp, sigma=0.8, step=1) if core.sum() > 30 else None
+    log.info("3D meshes: brain %s faces, tumor %s faces",
+             out["brain"].n_cells if out["brain"] is not None else 0, out["tumor"].n_cells if out["tumor"] is not None else 0)
+    return out
+
+
+def voxel_to_world(ijk, spacing):
+    return tuple(float(a) * float(s) for a, s in zip(ijk, spacing))

@@ -1,98 +1,69 @@
+"""Brain/background handling and robust intensity normalisation."""
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
+from scipy import ndimage as ndi
+from skimage.filters import threshold_otsu
 
-from src.io.nifti_loader import NiftiVolume
+
+def largest_component(mask: np.ndarray) -> np.ndarray:
+    lab, n = ndi.label(mask)
+    if n <= 1:
+        return mask
+    sizes = ndi.sum(mask, lab, index=np.arange(1, n + 1))
+    return lab == (1 + int(np.argmax(sizes)))
 
 
-def z_score_normalize(
-    data: np.ndarray,
-    mask: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    data = np.asarray(data, dtype=np.float32)
+def compute_brain_mask(volumes: Dict[str, np.ndarray], method: str = "auto", closing: int = 2) -> np.ndarray:
+    """Foreground mask from all modalities.
 
-    if mask is None:
-        mask = np.isfinite(data) & (data != 0)
-
+    * ``nonzero`` – BraTS-style skull-stripped data (background exactly 0).
+    * ``otsu``    – for data that is not skull-stripped (mean of normalised modalities).
+    * ``auto``    – nonzero, unless nearly everything is non-zero (then otsu).
+    """
+    stack = [np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) for v in volumes.values()]
+    nz = np.zeros(stack[0].shape, dtype=bool)
+    for v in stack:
+        nz |= v != 0
+    if method == "auto":
+        method = "otsu" if nz.mean() > 0.85 else "nonzero"
+    if method == "otsu":
+        acc = np.zeros(stack[0].shape, dtype=np.float32)
+        for v in stack:
+            hi = np.percentile(v, 99.5) or 1.0
+            acc += np.clip(v / hi, 0, 1)
+        acc /= len(stack)
+        mask = acc > threshold_otsu(acc)
     else:
-        mask = np.asarray(mask, dtype=bool)
-        mask &= np.isfinite(data)
-
-    if not np.any(mask):
-        return np.zeros_like(data, dtype=np.float32)
-
-    values = data[mask]
-    mean = np.mean(values)
-    std = np.std(values)
-
-    if std == 0:
-        return np.zeros_like(data, dtype=np.float32)
-
-    normalized = np.zeros_like(data, dtype=np.float32)
-    normalized[mask] = (data[mask] - mean) / std
-
-    return normalized
+        mask = nz
+    if closing > 0:
+        mask = ndi.binary_closing(mask, structure=ndi.generate_binary_structure(3, 1), iterations=closing)
+    mask = ndi.binary_fill_holes(mask)
+    mask = largest_component(mask)
+    return mask.astype(bool)
 
 
-def min_max_normalize(
-    data: np.ndarray,
-    mask: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    data = np.asarray(data, dtype=np.float32)
-
-    if mask is None:
-        mask = np.isfinite(data)
-
-    else:
-        mask = np.asarray(mask, dtype=bool)
-        mask &= np.isfinite(data)
-
-    if not np.any(mask):
-        return np.zeros_like(data, dtype=np.float32)
-
-    values = data[mask]
-    minimum = np.min(values)
-    maximum = np.max(values)
-
-    if maximum == minimum:
-        return np.zeros_like(data, dtype=np.float32)
-
-    normalized = np.zeros_like(data, dtype=np.float32)
-    normalized[mask] = (
-        (data[mask] - minimum)
-        / (maximum - minimum)
-    )
-
-    return normalized
+def robust_normalize(vol: np.ndarray, mask: np.ndarray, lower: float = 1.0, upper: float = 99.5) -> np.ndarray:
+    """Percentile window computed on brain voxels only → [0, 1]; background stays 0."""
+    vals = vol[mask]
+    lo, hi = np.percentile(vals, [lower, upper])
+    if hi <= lo:
+        hi = lo + 1.0
+    out = (vol - lo) / (hi - lo)
+    np.clip(out, 0.0, 1.0, out=out)
+    out[~mask] = 0.0
+    return out.astype(np.float32, copy=False)
 
 
-def normalize_volume(
-    volume: Union[NiftiVolume, np.ndarray],
-    method: str = "zscore",
-) -> np.ndarray:
-    if hasattr(volume, "get_data"):
-        data = volume.get_data(dtype=np.float32)
-    else:
-        data = np.asarray(volume, dtype=np.float32)
-
-    method = method.lower().strip()
-
-    if method == "zscore":
-        return z_score_normalize(data)
-
-    if method == "minmax":
-        return min_max_normalize(data)
-
-    raise ValueError(
-        f"Unknown normalization method: {method}. "
-        "Use 'zscore' or 'minmax'."
-    )
-
-
-__all__ = [
-    "z_score_normalize",
-    "min_max_normalize",
-    "normalize_volume",
-]
+def robust_stats(vol: np.ndarray, mask: np.ndarray, max_samples: int = 300_000, seed: int = 0):
+    """Median and robust standard deviation (1.4826·MAD) of brain voxels."""
+    vals = vol[mask]
+    if vals.size > max_samples:
+        vals = vals[np.random.default_rng(seed).choice(vals.size, max_samples, replace=False)]
+    med = float(np.median(vals))
+    mad = float(np.median(np.abs(vals - med))) * 1.4826
+    if mad < 1e-6:
+        mad = float(vals.std()) + 1e-6
+    return med, mad
